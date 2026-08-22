@@ -1,0 +1,33 @@
+# hybrid_attention 依赖 — 本仓库在 Python 3.10 + CUDA 12.6 + SM90 (H100) 下测试通过
+#
+# 安装方式（推荐 2 步）：
+#   1. 先装 PyTorch（必须匹配本机 CUDA 版本，默认 cu126）
+#      pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu126
+#   2. 再装其余依赖
+#      pip install -r requirements.txt
+#
+# 如果 CUDA 版本不是 12.6，把 cu126 换成 cu121/cu124/cu128，或直接
+#   pip install torch   # 让 pip 选默认源版本
+# 然后再 pip install -r requirements.txt。
+
+# ── 核心运行时 ──
+torch>=2.3,<2.8              # PyTorch（建议先按上面的命令单独装）
+triton>=2.2                  # Triton kernel JIT
+transformers>=4.45,<6.0      # Qwen3 / Llama3 attention 接口
+accelerate>=0.30             # transformers 辅助
+safetensors>=0.4             # 权重加载
+sentencepiece>=0.2           # 分词器
+tokenizers>=0.19
+einops>=0.7
+numpy>=1.24
+
+# ── Prefill 加速（强烈推荐）──
+# flash-attn 在首次 pip 编译需要 --no-build-isolation，且需要本机 CUDA toolkit
+# 如果想跳过本编译，改用预编译 wheel：
+#   https://github.com/Dao-AILab/flash-attention/releases
+flash-attn>=2.5
+
+# ── 评测依赖（仅跑 eval/ 目录下脚本时需要）──
+datasets>=2.18
+tqdm>=4.65
+pandas>=2.0

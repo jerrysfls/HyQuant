@@ -1,0 +1,36 @@
+This directory vendors a subset of SageAttention under Apache License 2.0.
+
+Upstream project:
+- https://github.com/thu-ml/SageAttention
+- Snapshot commit: d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5
+
+Vendored files:
+
+Triton kernels (original):
+- triton/quant_per_block.py
+- triton/attn_qk_int8_per_block.py
+- triton/attn_qk_int8_per_block_causal.py
+- triton/quant_per_thread.py
+
+Python wrappers (adapted for JIT compilation):
+- quant.py          — fused quantization helpers (per_warp_int8, per_channel_fp8, etc.)
+- sm90_compile.py   — torch.library.custom_op wrappers for SM90 attention kernel
+- core_sm90.py      — sageattn_qk_int8_pv_fp8_cuda_sm90 entry point
+
+CUDA kernel sources (from csrc/):
+- csrc/qattn/qk_int_sv_f8_cuda_sm90.cu  — SM90 attention kernel (WGMMA + TMA)
+- csrc/qattn/attn_cuda_sm90.h
+- csrc/qattn/pybind_sm90.cpp
+- csrc/qattn/attn_utils.cuh
+- csrc/fused/fused.cu       — fused quantization kernels
+- csrc/fused/fused.h
+- csrc/fused/pybind.cpp
+- csrc/utils.cuh, math.cuh, wgmma.cuh, dispatch_utils.h,
+  cp_async.cuh, numeric_conversion.cuh, permuted_smem.cuh, reduction_utils.cuh
+
+- LICENSE (copied from upstream)
+
+All files are retained with their original Apache-2.0 headers.
+Python wrappers (quant.py, sm90_compile.py, core_sm90.py) have been modified
+to use torch.utils.cpp_extension.load() for JIT CUDA compilation instead of
+pre-compiled extension modules.
