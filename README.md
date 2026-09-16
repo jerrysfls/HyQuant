@@ -19,7 +19,7 @@ HyQuant therefore keeps this tiny critical set in full precision and quantizes t
 remaining majority to low bits, with three components:
 
 1. **Vertical-line-aware retention** — a lightweight running column-mass score
-   (updated every 64 tokens) identifies the top-ρ vertical-line positions online,
+   identifies the top-ρ vertical-line positions online,
    with only 3–5% runtime overhead.
 2. **Prefill: fused hybrid-precision attention** — the bulk of the attention GEMMs run
    in low precision (INT8/FP8, INT4/FP4 depending on backend) while vertical-line and
