@@ -18,24 +18,28 @@ high-score positions.
 HyQuant therefore keeps this tiny critical set in full precision and quantizes the
 remaining majority to low bits, with three components:
 
-1. **Vertical-line-aware retention** — a lightweight running column-mass score
-   identifies the top-ρ vertical-line positions online,
-   with only 3–5% runtime overhead.
-2. **Prefill: fused hybrid-precision attention** — the bulk of the attention GEMMs run
-   in low precision (INT8/FP8, INT4/FP4 depending on backend) while vertical-line and
-   local-window tiles stay in FP16/BF16, fused into a single FlashAttention-style
-   Triton kernel.
-3. **Decode: hybrid low-bit KV cache + fused attention** — the KV cache is stored in
-   K4V4 for the majority and FP16 for vertical-line / window positions;
-   dequantization is fused into the decode attention kernel (online softmax over
-   quantized blocks), cutting memory traffic and bandwidth pressure.
+1. **Vertical-line-aware retention** — at the end of prefill, the last `W` query
+   vectors are mean-pooled and dotted against the non-window prefix keys; the top-ρ
+   positions become the vertical-line set. This is a single matmul per layer, and the
+   set is then frozen and reused for the whole decode phase.
+2. **Prefill: fused hybrid-precision attention** — the bulk of QKᵀ runs on INT8 tensor
+   cores (per-block scales, K-smoothing), PV runs in FP16 (or FP8 on SM90), while the
+   vertical-line and local-window tiles stay in FP16/BF16. The three segments share
+   one FlashAttention-style online softmax inside a single Triton kernel.
+3. **Decode: hybrid low-bit KV cache + fused attention** — at the prefill→decode
+   boundary the cache is reorganized into four segments: the quantized prefix (K4V4,
+   per-token scales), the frozen vertical-line tokens (BF16), the last `W` prefill
+   tokens (BF16), and a staging buffer that holds the most recent generated tokens in
+   BF16 and flushes them to 4-bit in groups of 128. Dequantization is fused into the
+   split-K decode kernel (one online softmax across all four segments), so no
+   full-precision KV is ever materialized.
 
 Across Qwen3-8B, Qwen3-32B, Llama-3.1-8B-Instruct, and GLM-4-9B-0414 on LongBench,
 GSM8K, and MATH500, HyQuant achieves **1.32×–3.58× decode-kernel speedup** and
 **1.04×–1.17× end-to-end decode speedup** while maintaining near-full-precision
 accuracy — and clearly improving over strict low-bit baselines.
 
-## Partial Results
+## Results
 
 ### Accuracy: LongBench v1 (average score)
 
@@ -80,16 +84,18 @@ real end-to-end gains.
 
 ### Prefill numerical error
 
-With FA2 as reference, retaining the top-5% vertical-line tokens and the local window
-in full precision reduces the layer-wise MSE of the attention output by a large factor
-compared with SageAttention across layers, and brings uniform 4-bit error down to near
-the 8-bit level from 1K to 32K context.
+With FA2 as reference, the hybrid INT8 prefill kernel that retains the top-5%
+vertical-line tokens and the local window in FP16 reduces the layer-wise MSE of the
+attention output by a large factor compared with SageAttention across layers.
+Prefill latency is on par with SageAttention.
 
 ### Overhead
 
-- Vertical-line identification: 3–5% of total runtime (amortized, every 64 tokens).
-- Query buffer: at most 64 FP16 query vectors (64 × H_Q × d × 2 bytes).
-- Keeping 5% of tokens in FP16 grows the KV cache by ~15% vs. strict 4-bit — offset in
+- Vertical-line identification: one mean-pooled query × prefix-key matmul per layer
+  at the prefill→decode boundary; 3–5% of total runtime in our measurements.
+- Query buffer: the last `W` (default 256) query vectors per layer are kept in BF16
+  during prefill and freed once the cache is frozen.
+- Keeping 5% of tokens in BF16 grows the KV cache by ~15% vs. strict 4-bit — offset in
   practice by the speed and accuracy gains.
 
 ## Installation
@@ -98,55 +104,40 @@ the 8-bit level from 1K to 32K context.
 
 | Component | Minimum | Tested |
 |---|---|---|
-| Python | 3.10 | 3.10.19 |
-| CUDA Toolkit | 12.0 | 12.8 |
-| PyTorch | 2.3 | 2.10.0+cu128 |
-| Triton | 2.2 | 3.6.0 |
-| Transformers | 4.45 | 4.52.0 |
-| flash-attn (optional, FA2 baseline) | 2.5 | 2.8.3 |
+| Python | 3.10 | 3.10 |
+| CUDA Toolkit | 12.0 | 12.6 |
+| PyTorch | 2.3 | 2.6.0+cu126 |
+| Triton | 2.2 | 3.2.0 |
+| Transformers | 4.45 | — |
+| flash-attn (optional, FA2 baseline) | 2.5 | 2.7.2 |
 
 GPU: SM80+ (A100/H100/RTX 40x0). The FP8-PV prefill path requires SM90 (H100-class).
 All paper experiments were run on a single NVIDIA H100 80GB.
 
-### Setup
+### Option A: one-command setup
 
 ```bash
-conda create -n hyquant python=3.10 -y
-conda activate hyquant
-
-# PyTorch (CUDA 12.8 wheels; pulls the matching Triton automatically)
-pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
-
-# Core dependencies
-pip install transformers==4.52.0 accelerate==1.12.0 datasets==4.5.0 \
-    tokenizers==0.21.4 safetensors einops numpy pandas matplotlib rouge tqdm
-
-# Optional: FA2 baseline (builds against the installed torch)
-pip install ninja packaging
-pip install flash-attn==2.8.3 --no-build-isolation
+cd script
+./install_env.sh                    # creates ./.venv, installs torch cu126 + requirements
+# ./install_env.sh --skip-flash-attn   # if you don't need the FA2 baseline
+source activate_env.sh
 ```
 
-For a different CUDA toolkit, swap the index URL (e.g. `.../whl/cu126`).
+Non-default CUDA versions: `./install_env.sh --torch-index-url https://download.pytorch.org/whl/cu124`.
 
-### Optional: baseline methods
-
-Only needed to reproduce the baseline rows in the tables:
+### Option B: manual
 
 ```bash
-# KIVI / quantized-cache baselines via HF QuantizedCache
-pip install hqq==0.2.8.post1 bitsandbytes
-
-# MInference comparison (eval/eval_longbench_minference.py)
-git clone https://github.com/microsoft/MInference && pip install -e ./MInference
-
-# KVTuner baseline (provides the flexible_quant package)
-git clone https://github.com/cmd2001/KVTuner && pip install -e ./KVTuner/flexible_quant
+python3.10 -m venv .venv && source .venv/bin/activate
+pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu126
+pip install -r requirements.txt     # add --no-build-isolation if flash-attn builds from source
 ```
 
 ### Datasets
 
 ```bash
-python eval/download_longbench_v2.py    # LongBench; GSM8K/MATH500 load via `datasets`
+cd script
+./download_datasets.sh              # LongBench v1 etc.; see also eval/download_longbench_v2.py
 ```
 
 ## Quick Start
@@ -166,7 +157,8 @@ model = AutoModelForCausalLM.from_pretrained(
     attn_implementation="flash_attention_2",
 ).cuda()
 
-# Full HyQuant configuration: K4V4 cache + top-5% vertical lines + 256-token window
+# Full HyQuant configuration: hybrid INT8 prefill + K4V4 cache
+# + top-5% vertical lines + 256-token window
 model = patch_attention_forward_model(
     model, mode="hybrid_full", window_size=256, top_ratio=0.05,
 )
@@ -182,33 +174,33 @@ outputs = model.generate(input_ids, past_key_values=cache, max_new_tokens=1024)
 
 ### Mode reference
 
-| Mode | Meaning |
-|---|---|
-| `dense` / `full_attention` | Full-precision baselines (HF attention / Triton FP16) |
-| `sage_w0` / `sage_w` | INT8 SageAttention-style prefill, without / with local window |
-| `vquant_vert` | Prefill hybrid precision with vertical-line retention |
-| `d_k4v4` / `d_k8v8` / `d_k4v2` / `d_k2v4` | Strict low-bit decode KV cache (K/V bit-widths) |
-| `d_k4v4_vert` (etc.) | Low-bit decode cache + full-precision vertical lines |
-| `hybrid_full` | **Full HyQuant** (K4V4 + vertical lines + window) |
-| `kivi` / `kvtuner` | Baselines via HF quantized cache (eval scripts only) |
+| Mode | Prefill | Decode KV cache |
+|---|---|---|
+| `dense` / `full_attention` / `flash_attention_2` | full precision | full precision |
+| `sage_w0` / `sage_w` | INT8 QK + FP16 PV, without / with local window | full precision |
+| `vquant_vert` | INT8 QK + FP16 PV + FP16 vertical lines & window | full precision |
+| `d_k4v4` / `d_k8v8` / `d_k4v2` / `d_k2v4` | full precision | strict low-bit (K/V bit-widths as named) |
+| `d_k4v4_vert` (etc.) | full precision | low-bit + BF16 vertical lines & window |
+| **`hybrid_full`** | same as `vquant_vert` | K4V4 + BF16 vertical lines & window (**full HyQuant**) |
+| `hybrid_k4v2` / `hybrid_k2v4` | same as `vquant_vert` | K4V2 / K2V4 + BF16 vertical lines & window |
+| `kivi` / `kvtuner` | full precision | HF `HQQQuantizedCache` baselines (eval scripts only) |
 
 Key hyperparameters: `window_size` (local full-precision window, default 256) and
 `top_ratio` (vertical-line retention ratio ρ, default 0.05 = top-5%).
 
 ## Reproducing the Paper
 
+LongBench v1 (Tables 2–5). Pass `--modes` explicitly; the wrapper's default mode
+list predates the current mode names.
+
 ```bash
 cd script
-
-# LongBench v1 (Tables 2–5)
-./run.sh longbench --model-path /path/to/model --data-dir /path/to/longbench
-
-# Math reasoning (GSM8K / MATH500)
-./run.sh math --model-path /path/to/model --data-dir /path/to/data \
-  --dataset math500 --mode hybrid_full
+./run.sh longbench --model-path /path/to/Qwen3-8B --data-dir /path/to/longbench \
+  --modes flash_attention_2,kivi,kvtuner,sage_w,hybrid_full \
+  --window-size 256 --top-ratio 0.05
 ```
 
-Or call an evaluator directly:
+Or call the evaluator directly for a single task:
 
 ```bash
 python eval/eval_longbench.py \
@@ -216,49 +208,41 @@ python eval/eval_longbench.py \
   --task hotpotqa --mode hybrid_full --window_size 256 --top_ratio 0.05
 ```
 
+Note: the math evaluators under `eval/` (`eval_math_unified.py`,
+`eval_math500_llama3.py`) currently accept only the legacy prefill-only mode names and
+have not been migrated to the `hybrid_*` modes; use `eval_longbench.py` for the
+HyQuant configuration.
+
 ## Repository Structure
 
 ```
 HyQuant/
 ├── src/
-│   ├── patch/                       # In-place attention patches
-│   │   ├── _common.py               #   mode dispatch, vertical-line scoring, shared utils
-│   │   ├── patch_qwen.py            #   Qwen3
-│   │   ├── patch_llama.py           #   Llama-3
-│   │   └── patch_glm.py             #   GLM-4
-│   └── ops/                         # Triton kernels & KV caches
-│       ├── sage_unified.py          #   INT8-QK + FP16-PV prefill attention (+ window/vertical variants)
-│       ├── sage_unified_fp8.py      #   FP8 prefill variants (SM90)
-│       ├── sage_fp8_attention.py    #   INT8-QK + FP8-PV prefill attention (SM90)
-│       ├── decode_d_stage.py        #   fused dequant + decode attention kernels
-│       ├── d_stage_kv_cache.py      #   hybrid low-bit KV cache (DStageKVCache)
-│       └── vendor/                  #   vendored SageAttention baseline
-├── eval/                            # Evaluators & run scripts
-│   ├── eval_longbench.py            #   LongBench v1
-│   ├── eval_longbench_minference.py #   LongBench vs. MInference baseline
-│   ├── eval_math_unified.py         #   GSM8K / MATH500 (unified entry)
-│   ├── eval_mcq.py                  #   multiple-choice QA
-│   ├── grader.py, parser.py         #   math answer grading utilities
-│   ├── aggregate_*.py               #   result aggregation
-│   └── download_longbench_v2.py     #   dataset download
-├── script/                          # Env setup, dataset download, run wrappers
-│   ├── install_env.sh               #   one-command venv setup
-│   ├── download_datasets.sh         #   LongBench v1 etc.
-│   ├── run.sh                       #   unified eval entry (longbench / math)
-│   └── smoke_test_model.py          #   quick model sanity check
-├── requirements.txt                 # Python dependencies (used by install_env.sh)
-├── LICENSE
-└── README.md
+│   ├── patch/                  # In-place attention patches
+│   │   ├── _common.py          #   mode dispatch, vertical-line scoring, shared utils
+│   │   ├── patch_qwen.py       #   Qwen3
+│   │   ├── patch_llama.py      #   Llama-3
+│   │   └── patch_glm.py        #   GLM-4
+│   └── ops/                    # Triton kernels & KV caches
+│       ├── sage_unified.py     #   INT8-QK + FP16-PV prefill attention (+ window/vertical variants)
+│       ├── sage_fp8_attention.py #  INT8-QK + FP8-PV prefill attention (SM90)
+│       ├── decode_d_stage.py   #   fused dequant + split-K decode attention kernels
+│       └── d_stage_kv_cache.py #   hybrid low-bit KV cache (DStageKVCache, freeze/staging logic)
+├── eval/                       # LongBench, GSM8K/MATH500, MCQ evaluators
+├── script/                     # Env setup, dataset download, run wrappers
+├── requirements.txt
+└── LICENSE                     # MIT
 ```
+
+## License
+
+MIT. See `LICENSE`.
 
 ## Citation
 
 ```bibtex
 @inproceedings{hyquant2026,
   title     = {HyQuant: Hybrid-Precision Quantization for LLM Attention},
-  author    = {Ding, Jiatong and Xing, Bingxin and Zhang, Yu and Ding, Dian and
-               Yi, Xiaodong and Ouyang, Xianbin and Zhou, Feihu and Zhang, Kun and
-               Guo, Zhenyu and Pan, Hao and Xue, Guangtao and Zhang, Yiming},
   booktitle = {Proceedings of the 2026 Conference on Empirical Methods in Natural Language Processing (EMNLP)},
   year      = {2026}
 }
